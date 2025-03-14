@@ -1,3 +1,13 @@
 # SecureSMSApp
 
 Project for CSI-4600 
+
+How to run the code locally
+
+1. Download the code first and unzip the folder.
+2. Open Command prompt and go to the folder of the project. Once in the project folder create a virtual enviroment to run the code.
+3. Type "python -m venv venv"
+4. After that type "venv\Scripts\activate.bat"
+5. Once you are in the virtual enviroment it will say venv on the left side. Next type "pip install -r requirements.txt" to install the requirements.
+6. Then you can run the server.py
+7. Open a second terminal to
