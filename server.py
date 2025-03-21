@@ -1,6 +1,7 @@
 import socket
 import threading
 import jwt
+import os
 from jwt import PyJWKClient
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -12,6 +13,9 @@ CLIENT_ID = "2cfbeb4e-3216-485c-bbc3-8f408b55a969"
 
 # Pre-shared 256-bit key (32 bytes)
 SHARED_KEY = b'ThisIsASecretKeyForAES256Encrypt'
+
+# A global list of (socket, nickname) for all connected clients
+clients = []
 
 def validate_token(token):
     try:
@@ -41,7 +45,35 @@ def recvall(sock, length):
         data += chunk
     return data
 
+def broadcast_message(sender_socket, nickname, plaintext):
+    """
+    Re-encrypts the plaintext and broadcasts it to all connected clients,
+    including the sender. This ensures everyone sees "[nickname] message".
+    """
+    full_text = f"[{nickname}] {plaintext.decode(errors='replace')}"
+    message_bytes = full_text.encode()
+
+    # Broadcast to every client in the list
+    for (cli_sock, cli_nick) in clients:
+        try:
+            aesgcm = AESGCM(SHARED_KEY)
+            nonce = os.urandom(12)
+            ciphertext = aesgcm.encrypt(nonce, message_bytes, None)
+
+            # Construct the same wire format: "MSG" + <nonce-len> + nonce + <ct-len> + ciphertext
+            packet = (
+                b"MSG"
+                + len(nonce).to_bytes(2, 'big')
+                + nonce
+                + len(ciphertext).to_bytes(4, 'big')
+                + ciphertext
+            )
+            cli_sock.sendall(packet)
+        except Exception as e:
+            print(f"Failed to broadcast to {cli_nick}: {str(e)}")
+
 def handle_client(client_sock):
+    nickname = None
     try:
         client_sock.settimeout(60)
         # Receive authentication data: nickname|token
@@ -66,33 +98,50 @@ def handle_client(client_sock):
         client_sock.sendall(b'AUTH_OK')
         print(f"[SERVER] {nickname} authenticated successfully.")
 
-        # Initialize AES-GCM with the pre-shared key
+        # Store this client in the global list
+        clients.append((client_sock, nickname))
+
+        # Initialize AES-GCM with the pre-shared key for receiving from THIS client
         aesgcm = AESGCM(SHARED_KEY)
-        print("[SERVER] AES-GCM initialized with shared key.")
+        print("[SERVER] AES-GCM initialized with shared key for client:", nickname)
 
         # Process incoming encrypted messages
         while True:
             header = recvall(client_sock, 3)
             if not header or header != b"MSG":
                 break
+
             nonce_length_bytes = recvall(client_sock, 2)
             if len(nonce_length_bytes) < 2:
                 break
             nonce_length = int.from_bytes(nonce_length_bytes, 'big')
+
             nonce = recvall(client_sock, nonce_length)
             ct_length_bytes = recvall(client_sock, 4)
             if len(ct_length_bytes) < 4:
                 break
             ct_length = int.from_bytes(ct_length_bytes, 'big')
             ciphertext = recvall(client_sock, ct_length)
+
             try:
                 plaintext = aesgcm.decrypt(nonce, ciphertext, None)
                 print(f"{nickname}: {plaintext.decode(errors='replace')}")
+                # Now broadcast to all clients (including the sender)
+                broadcast_message(client_sock, nickname, plaintext)
+
             except Exception as e:
                 print(f"Decryption error for {nickname}: {str(e)}")
+
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error in handle_client for {nickname}: {str(e)}")
+
     finally:
+        # Remove from global list
+        print(f"[SERVER] {nickname} disconnected.")
+        for i, (s, n) in enumerate(clients):
+            if s == client_sock:
+                clients.pop(i)
+                break
         client_sock.close()
 
 def main():

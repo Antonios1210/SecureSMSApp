@@ -13,7 +13,7 @@ CLIENT_ID = "2cfbeb4e-3216-485c-bbc3-8f408b55a969"
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPE = [f"api://{CLIENT_ID}/access_as_user"]
 
-# Pre-shared 256-bit key (32 bytes)
+# Same pre-shared key as server
 SHARED_KEY = b'ThisIsASecretKeyForAES256Encrypt'
 
 def get_token():
@@ -31,7 +31,6 @@ def get_token():
         sys.exit(1)
 
 def recvall(sock, length):
-    """Receive exactly length bytes from a socket."""
     data = b''
     while len(data) < length:
         chunk = sock.recv(length - len(data))
@@ -45,58 +44,81 @@ def main():
     try:
         sock.connect((SERVER_HOST, SERVER_PORT))
         sock.settimeout(60)
+
         nickname = input("Nickname: ").strip()
         token = get_token().strip()
+        # Send nickname|token for server validation
         sock.sendall(f"{nickname}|{token}".encode())
 
-        # Wait for authentication confirmation
+        # Wait for server's auth confirmation
         auth_response = recvall(sock, 7)
         if auth_response != b'AUTH_OK':
             print("Authentication failed:", auth_response.decode())
             return
 
         print("Authentication successful. Connected!")
-        # Initialize AES-GCM with the pre-shared key
+        # Initialize AES-GCM with the same shared key
         aesgcm = AESGCM(SHARED_KEY)
-        print("AES-GCM initialized with shared key.")
+        print(f"AES-GCM initialized with shared key for client: {nickname}")
 
+        # ----- RECEPTION THREAD -----
         def receive_thread():
             while True:
                 try:
+                    # 1) Check header
                     header = recvall(sock, 3)
                     if not header or header != b"MSG":
+                        # Server might have closed or error
                         break
+
+                    # 2) Read nonce length + nonce
                     nonce_length_bytes = recvall(sock, 2)
                     if len(nonce_length_bytes) < 2:
                         break
                     nonce_length = int.from_bytes(nonce_length_bytes, 'big')
                     nonce = recvall(sock, nonce_length)
+
+                    # 3) Read ciphertext length + ciphertext
                     ct_length_bytes = recvall(sock, 4)
                     if len(ct_length_bytes) < 4:
                         break
                     ct_length = int.from_bytes(ct_length_bytes, 'big')
                     ciphertext = recvall(sock, ct_length)
-                    try:
-                        msg = aesgcm.decrypt(nonce, ciphertext, None)
-                        print(f"\n[Remote]: {msg.decode()}")
-                    except Exception as e:
-                        print(f"Decryption error: {str(e)}")
-                except Exception:
+
+                    # 4) Decrypt
+                    msg = aesgcm.decrypt(nonce, ciphertext, None)
+                    # Convert to string
+                    msg_str = msg.decode(errors='replace')
+                    # Print EXACTLY what the server broadcasted
+                    # e.g. "[Alice] Hello everyone"
+                    print(msg_str)
+
+                except Exception as e:
+                    print("Error in receiving messages:", str(e))
                     break
 
         threading.Thread(target=receive_thread, daemon=True).start()
 
+        # ----- SENDING LOOP -----
         while True:
-            msg = input("> ")
+            msg = input("")
+            # If user types nothing, skip
+            if not msg:
+                continue
+            # Prepare to send
             nonce = os.urandom(12)
-            encrypted = aesgcm.encrypt(nonce, msg.encode(), None)
-            sock.sendall(
-                b"MSG" +
-                len(nonce).to_bytes(2, 'big') +
-                nonce +
-                len(encrypted).to_bytes(4, 'big') +
-                encrypted
+            ciphertext = aesgcm.encrypt(nonce, msg.encode(), None)
+
+            # Construct the packet: "MSG" + <nonce-len> + nonce + <ct-len> + ciphertext
+            packet = (
+                b"MSG"
+                + len(nonce).to_bytes(2, 'big')
+                + nonce
+                + len(ciphertext).to_bytes(4, 'big')
+                + ciphertext
             )
+            sock.sendall(packet)
+
     except KeyboardInterrupt:
         print("\nExiting...")
     finally:
