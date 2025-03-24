@@ -19,24 +19,39 @@ clients = []
 
 def validate_token(token):
     try:
+        # Make sure it's a well-formed JWT
         if not token or len(token.split('.')) != 3:
             return False, "Invalid JWT format"
+
+        # Get signing keys
         jwks_url = f"https://login.microsoftonline.com/{TENANT_ID}/discovery/keys"
         jwk_client = PyJWKClient(jwks_url)
         signing_key = jwk_client.get_signing_key_from_jwt(token)
-        jwt.decode(
+
+        # Decode WITHOUT forcing the issuer, but still check audience
+        # We'll manually check issuer afterwards.
+        decoded = jwt.decode(
             token,
             signing_key.key,
             algorithms=["RS256"],
-            audience=f"api://{CLIENT_ID}",
-            issuer=f"https://sts.windows.net/{TENANT_ID}/"
+            audience=[f"api://{CLIENT_ID}"],  # must match the 'aud' in your token
+            options={"verify_iss": False},    # skip automatic issuer check
         )
+
+        # Manually verify that the token's 'iss' is one of the two valid patterns
+        allowed_issuers = [
+            f"https://sts.windows.net/{TENANT_ID}/",
+            f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+        ]
+        actual_iss = decoded.get("iss", "")
+        if actual_iss not in allowed_issuers:
+            return False, f"Issuer mismatch: {actual_iss}"
+
         return True, "Valid"
     except Exception as e:
         return False, str(e)
 
 def recvall(sock, length):
-    """Receive exactly length bytes from a socket."""
     data = b''
     while len(data) < length:
         chunk = sock.recv(length - len(data))
@@ -46,21 +61,13 @@ def recvall(sock, length):
     return data
 
 def broadcast_message(sender_socket, nickname, plaintext):
-    """
-    Re-encrypts the plaintext and broadcasts it to all connected clients,
-    including the sender. This ensures everyone sees "[nickname] message".
-    """
     full_text = f"[{nickname}] {plaintext.decode(errors='replace')}"
     message_bytes = full_text.encode()
-
-    # Broadcast to every client in the list
     for (cli_sock, cli_nick) in clients:
         try:
             aesgcm = AESGCM(SHARED_KEY)
             nonce = os.urandom(12)
             ciphertext = aesgcm.encrypt(nonce, message_bytes, None)
-
-            # Construct the same wire format: "MSG" + <nonce-len> + nonce + <ct-len> + ciphertext
             packet = (
                 b"MSG"
                 + len(nonce).to_bytes(2, 'big')
@@ -76,7 +83,6 @@ def handle_client(client_sock):
     nickname = None
     try:
         client_sock.settimeout(60)
-        # Receive authentication data: nickname|token
         data = b''
         while b'|' not in data:
             chunk = client_sock.recv(4096)
@@ -94,18 +100,13 @@ def handle_client(client_sock):
             client_sock.sendall(f"ERR|{msg}".encode())
             return
 
-        # Authentication successful; send confirmation
         client_sock.sendall(b'AUTH_OK')
         print(f"[SERVER] {nickname} authenticated successfully.")
-
-        # Store this client in the global list
         clients.append((client_sock, nickname))
 
-        # Initialize AES-GCM with the pre-shared key for receiving from THIS client
         aesgcm = AESGCM(SHARED_KEY)
         print("[SERVER] AES-GCM initialized with shared key for client:", nickname)
 
-        # Process incoming encrypted messages
         while True:
             header = recvall(client_sock, 3)
             if not header or header != b"MSG":
@@ -126,9 +127,7 @@ def handle_client(client_sock):
             try:
                 plaintext = aesgcm.decrypt(nonce, ciphertext, None)
                 print(f"{nickname}: {plaintext.decode(errors='replace')}")
-                # Now broadcast to all clients (including the sender)
                 broadcast_message(client_sock, nickname, plaintext)
-
             except Exception as e:
                 print(f"Decryption error for {nickname}: {str(e)}")
 
@@ -136,7 +135,6 @@ def handle_client(client_sock):
         print(f"Error in handle_client for {nickname}: {str(e)}")
 
     finally:
-        # Remove from global list
         print(f"[SERVER] {nickname} disconnected.")
         for i, (s, n) in enumerate(clients):
             if s == client_sock:
