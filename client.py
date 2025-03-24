@@ -5,7 +5,7 @@ import sys
 import threading
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-SERVER_HOST = "127.0.0.1"
+SERVER_HOST = "10.0.1.4"
 SERVER_PORT = 4000
 
 TENANT_ID = "2940786f-5af0-48fb-adb7-56da78440d61"
@@ -13,7 +13,6 @@ CLIENT_ID = "2cfbeb4e-3216-485c-bbc3-8f408b55a969"
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPE = [f"api://{CLIENT_ID}/access_as_user"]
 
-# Same pre-shared key as server
 SHARED_KEY = b'ThisIsASecretKeyForAES256Encrypt'
 
 def get_token():
@@ -47,50 +46,40 @@ def main():
 
         nickname = input("Nickname: ").strip()
         token = get_token().strip()
-        # Send nickname|token for server validation
+
+        # Send "nickname|token"
         sock.sendall(f"{nickname}|{token}".encode())
 
-        # Wait for server's auth confirmation
+        # Wait for server's auth confirmation (7 bytes)
         auth_response = recvall(sock, 7)
         if auth_response != b'AUTH_OK':
-            print("Authentication failed:", auth_response.decode())
+            print("Authentication failed:", auth_response.decode(errors='replace'))
             return
 
         print("Authentication successful. Connected!")
-        # Initialize AES-GCM with the same shared key
         aesgcm = AESGCM(SHARED_KEY)
         print(f"AES-GCM initialized with shared key for client: {nickname}")
 
-        # ----- RECEPTION THREAD -----
         def receive_thread():
             while True:
                 try:
-                    # 1) Check header
                     header = recvall(sock, 3)
                     if not header or header != b"MSG":
-                        # Server might have closed or error
                         break
-
-                    # 2) Read nonce length + nonce
                     nonce_length_bytes = recvall(sock, 2)
                     if len(nonce_length_bytes) < 2:
                         break
                     nonce_length = int.from_bytes(nonce_length_bytes, 'big')
                     nonce = recvall(sock, nonce_length)
 
-                    # 3) Read ciphertext length + ciphertext
                     ct_length_bytes = recvall(sock, 4)
                     if len(ct_length_bytes) < 4:
                         break
                     ct_length = int.from_bytes(ct_length_bytes, 'big')
                     ciphertext = recvall(sock, ct_length)
 
-                    # 4) Decrypt
                     msg = aesgcm.decrypt(nonce, ciphertext, None)
-                    # Convert to string
                     msg_str = msg.decode(errors='replace')
-                    # Print EXACTLY what the server broadcasted
-                    # e.g. "[Alice] Hello everyone"
                     print(msg_str)
 
                 except Exception as e:
@@ -99,17 +88,13 @@ def main():
 
         threading.Thread(target=receive_thread, daemon=True).start()
 
-        # ----- SENDING LOOP -----
+        # Sending loop
         while True:
             msg = input("")
-            # If user types nothing, skip
             if not msg:
                 continue
-            # Prepare to send
             nonce = os.urandom(12)
             ciphertext = aesgcm.encrypt(nonce, msg.encode(), None)
-
-            # Construct the packet: "MSG" + <nonce-len> + nonce + <ct-len> + ciphertext
             packet = (
                 b"MSG"
                 + len(nonce).to_bytes(2, 'big')
