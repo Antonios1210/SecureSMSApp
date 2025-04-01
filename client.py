@@ -2,10 +2,13 @@ import socket
 import msal
 import os
 import sys
-import threading
 import time
-import hashlib
+import threading
+import tkinter as tk
+from tkinter import scrolledtext, simpledialog, messagebox
+import webbrowser
 import hmac
+import hashlib
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -13,41 +16,32 @@ from cryptography.hazmat.primitives import hashes
 SERVER_HOST = "10.0.1.4"
 SERVER_PORT = 4000
 
-# Azure AD IDs to validate whether JWTs (JSON Web Tokens) came from a trusted Microsoft account
 TENANT_ID = "2940786f-5af0-48fb-adb7-56da78440d61"
 CLIENT_ID = "2cfbeb4e-3216-485c-bbc3-8f408b55a969"
-
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPE = [f"api://{CLIENT_ID}/access_as_user"]
 
+###############################################################################
+# Behavioral Key-Derivation Function (AES & HMAC)
+###############################################################################
+def derive_keys(user_id: str, time_slice: str) -> (bytes, bytes):
+    """
+    Derives two keys (one for AES-GCM encryption, one for HMAC) from a master secret
+    based on the user's identifier + a time slice (e.g. the current minute).
+    """
+    seed = f"{user_id}|{time_slice}"
+    # 1) Take a SHA-256 of the seed
+    master = hashlib.sha256(seed.encode()).digest()
+    # 2) HKDF to expand into 64 bytes, then split into two keys
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=None, info=b'secure_sms_behavioral')
+    key_material = hkdf.derive(master)
+    aes_key = key_material[:32]
+    hmac_key = key_material[32:]
+    return aes_key, hmac_key
 
-# Function to handle Microsoft’s device login flow 
-def get_token():
-    try:
-        # Create a client app that will request a token
-        app = msal.PublicClientApplication(client_id=CLIENT_ID, authority=AUTHORITY)
-        
-        # Begin device login flow
-        flow = app.initiate_device_flow(scopes=SCOPE)
-        
-        # Check if the response provided a login code
-        if "user_code" not in flow:
-            print("Device flow failed")
-            sys.exit(1)
-
-        # Prompt the client to go to the URL and enter the login code
-        print(f"\nOpen {flow['verification_uri']} and enter code: {flow['user_code']}")
-        
-        # Wait for the login process to complete and return the access token
-        token_response = app.acquire_token_by_device_flow(flow)
-        return token_response["access_token"]
-    
-    # If any of the checks failed, throw an exception and print that there was a token error
-    except Exception as e:
-        print(f"Token error: {str(e)}")
-        sys.exit(1)
-
-# Function to keep receiving chunks of data until the full message is received
+###############################################################################
+# A helper function to receive an exact number of bytes (like recvall).
+###############################################################################
 def recvall(sock, length):
     data = b''
     while len(data) < length:
@@ -57,130 +51,198 @@ def recvall(sock, length):
         data += chunk
     return data
 
-def derive_keys(user_id: str, time_slice: str) -> (bytes, bytes):
-    """
-    Derives two independent keys from a master secret based on behavioral entropy.
-    The master secret is built from the user identifier and the current time slice (in minutes).
-    HKDF is then used to produce 64 bytes of key material, which are split into:
-      - a 32-byte AES-GCM key
-      - a 32-byte HMAC key
-    """
-    seed = f"{user_id}|{time_slice}"
-    master = hashlib.sha256(seed.encode()).digest()
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=None, info=b'secure_sms_behavioral')
-    key_material = hkdf.derive(master)
-    aes_key = key_material[:32]
-    hmac_key = key_material[32:]
-    return aes_key, hmac_key
+###############################################################################
+# The main UI-based secure chat client class
+###############################################################################
+class SecureChatClient:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Secure Chat Client")
 
-def main():
-    # Create a socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock = None
+        self.aesgcm = None
+        self.hmac_key = None
+        self.time_slice = None
 
-    try:
-        # Connect to the server
-        sock.connect((SERVER_HOST, SERVER_PORT))
+        # -------------------- UI Elements --------------------
+        self.chat_display = scrolledtext.ScrolledText(master, wrap=tk.WORD, state='disabled', width=60, height=20)
+        self.chat_display.pack(padx=10, pady=10)
 
-        # Timeout after 300 seconds
-        sock.settimeout(300)
+        self.msg_entry = tk.Entry(master, width=50)
+        self.msg_entry.pack(side=tk.LEFT, padx=(10, 0), pady=(0, 10))
+        self.msg_entry.bind('<Return>', lambda e: self.send_message())
 
-        # Prompt the client for their nickname
-        nickname = input("Nickname: ").strip()
-        
-        # Get the token
-        token = get_token().strip()
+        self.send_button = tk.Button(master, text="Send", command=self.send_message)
+        self.send_button.pack(side=tk.LEFT, padx=10, pady=(0, 10))
 
-        # Get the current time slice (e.g., current minute) as a string
-        time_slice = str(int(time.time()) // 60)
+        self.status_label = tk.Label(master, text="Disconnected", fg="red")
+        self.status_label.pack(side=tk.BOTTOM, pady=(0, 5))
 
-        # Send the nickname, token, and time_slice to the server (handshake)
-        sock.sendall(f"{nickname}|{token}|{time_slice}".encode())
-
-        # Wait for server's authentication confirmation
-        auth_response = recvall(sock, 7)
-
-        # If the authentication failed, print to the client terminal that it failed
-        if auth_response != b'AUTH_OK':
-            print("Authentication failed:", auth_response.decode(errors='replace'))
+        # Prompt user for nickname
+        self.nickname = simpledialog.askstring("Nickname", "Enter your nickname:")
+        if not self.nickname:
+            master.destroy()
             return
 
-        # Print to the client terminal that the authentication and connection was successful
-        print("Authentication successful. Connected!")
-        
-        # Derive AES and HMAC keys using the behavioral entropy-based function
-        aes_key, hmac_key = derive_keys(nickname, time_slice)
+        # Attempt to connect
+        self.connect()
 
-        # Initialize AES-GCM with the derived AES key
-        aesgcm = AESGCM(aes_key)
-        print(f"AES-GCM initialized with derived key for client: {nickname}")
+    def append_chat(self, msg):
+        """Utility to safely add text into the chat display."""
+        self.chat_display.config(state='normal')
+        self.chat_display.insert(tk.END, msg + "\n")
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state='disabled')
 
-        # Nested function to receive other client messages
-        def receive_thread():
+    ###############################################################################
+    # Device flow: get_token() with MSAL, but using a popup for the user
+    ###############################################################################
+    def get_token(self):
+        try:
+            # Create MSAL PublicClientApplication
+            app = msal.PublicClientApplication(client_id=CLIENT_ID, authority=AUTHORITY)
+            # Initiate the device flow
+            flow = app.initiate_device_flow(scopes=SCOPE)
+            if "user_code" not in flow:
+                raise Exception("Device flow failed")
+
+            # Pop up to let the user follow the link and code
+            self.show_device_login_popup(flow['verification_uri'], flow['user_code'])
+            # Wait for user to close the popup (i.e., they've finished logging in)
+            self.master.wait_window(self.login_popup)
+
+            token_response = app.acquire_token_by_device_flow(flow)
+            return token_response["access_token"]
+        except Exception as e:
+            messagebox.showerror("Authentication Error", str(e))
+            self.master.destroy()
+            sys.exit(1)
+
+    def show_device_login_popup(self, uri, code):
+        """A small popup with a clickable login URL and code."""
+        self.login_popup = tk.Toplevel(self.master)
+        self.login_popup.title("Device Login")
+        self.login_popup.geometry("400x160")
+
+        link_label = tk.Label(self.login_popup, text=uri, fg="blue", cursor="hand2")
+        link_label.pack(pady=(20, 5))
+        link_label.bind("<Button-1>", lambda e: webbrowser.open_new(uri))
+
+        code_label = tk.Label(self.login_popup, text=f"Code: {code}", font=("Courier", 12))
+        code_label.pack(pady=(5, 5))
+
+        # Copy code to clipboard
+        self.master.clipboard_clear()
+        self.master.clipboard_append(code)
+        messagebox.showinfo("Copied", "Code copied to clipboard!")
+
+        ok_button = tk.Button(self.login_popup, text="I've Logged In", command=self.login_popup.destroy)
+        ok_button.pack(pady=(10, 10))
+
+    ###############################################################################
+    # Establish the socket connection, do handshake, derive keys, spawn recv thread
+    ###############################################################################
+    def connect(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.connect((SERVER_HOST, SERVER_PORT))
+            # A more generous timeout for user interaction
+            self.sock.settimeout(300)
+
+            # Acquire token
+            token = self.get_token().strip()
+
+            # Derive a time_slice (the current minute)
+            self.time_slice = str(int(time.time()) // 60)
+
+            # Send handshake: nickname|token|time_slice
+            self.sock.sendall(f"{self.nickname}|{token}|{self.time_slice}".encode())
+
+            # Check authentication from server
+            auth_response = recvall(self.sock, 7)
+            if auth_response != b"AUTH_OK":
+                messagebox.showerror("Authentication Failed", auth_response.decode(errors='replace'))
+                self.master.destroy()
+                return
+
+            # Mark connected
+            self.status_label.config(text="Connected", fg="green")
+            self.append_chat("[Info] Authentication successful. Connected to server.")
+
+            # Derive AES and HMAC keys
+            aes_key, self.hmac_key = derive_keys(self.nickname, self.time_slice)
+            self.aesgcm = AESGCM(aes_key)
+
+            # Start a thread to continuously read from server
+            threading.Thread(target=self.receive_thread, daemon=True).start()
+
+        except Exception as e:
+            messagebox.showerror("Connection Error", str(e))
+            self.master.destroy()
+
+    ###############################################################################
+    # Receiving messages in a background thread
+    ###############################################################################
+    def receive_thread(self):
+        try:
             while True:
-                try:
-                    # Wait for a message with a valid MSG header from the server
-                    header = recvall(sock, 3)
-                    if not header or header != b"MSG":
-                        break
-                    
-                    # Get the nonce length in bytes
-                    nonce_length_bytes = recvall(sock, 2)
-                    if len(nonce_length_bytes) < 2:
-                        break
-
-                    # Convert the nonce length from bytes to a number
-                    nonce_length = int.from_bytes(nonce_length_bytes, 'big')
-                    
-                    # Get the value of the nonce to be used for AES-GCM decryption
-                    nonce = recvall(sock, nonce_length)
-
-                    # Get the ciphertext length in bytes
-                    ct_length_bytes = recvall(sock, 4)
-                    if len(ct_length_bytes) < 4:
-                        break
-
-                    # Convert the ciphertext length from bytes to a number
-                    ct_length = int.from_bytes(ct_length_bytes, 'big')
-                    
-                    # Get the value of the ciphertext
-                    ciphertext = recvall(sock, ct_length)
-
-                    # Decrypt the message using AES-GCM
-                    msg = aesgcm.decrypt(nonce, ciphertext, None)
-                    msg_str = msg.decode(errors='replace')
-                    
-                    # Print the message
-                    print(msg_str)
-
-                # If any of the checks fail, throw an exception and print that there was an error 
-                # in receiving the message
-                except Exception as e:
-                    print("Error in receiving messages:", str(e))
+                # Expect a 'MSG' header
+                header = recvall(self.sock, 3)
+                if not header or header != b"MSG":
                     break
 
-        # Enable messages to be received and sent at the same time
-        threading.Thread(target=receive_thread, daemon=True).start()
+                # Nonce length
+                nonce_length_bytes = recvall(self.sock, 2)
+                if len(nonce_length_bytes) < 2:
+                    break
+                nonce_length = int.from_bytes(nonce_length_bytes, 'big')
+                nonce = recvall(self.sock, nonce_length)
 
-        # Infinite loop to send messages
-        while True:
-            # Receive the client's input 
-            msg = input("")
-            if not msg:
-                continue
+                # Ciphertext length
+                ct_length_bytes = recvall(self.sock, 4)
+                if len(ct_length_bytes) < 4:
+                    break
+                ct_length = int.from_bytes(ct_length_bytes, 'big')
+                ciphertext = recvall(self.sock, ct_length)
 
-            # Generate an HMAC over the plaintext message using the derived HMAC key
-            hmac_digest = hmac.new(hmac_key, msg.encode(), hashlib.sha256).digest()
+                # Decrypt
+                plaintext = self.aesgcm.decrypt(nonce, ciphertext, None)
+                # The plaintext includes the message and the HMAC, separated by ||HMAC||
+                if b'||HMAC||' not in plaintext:
+                    raise ValueError("Missing HMAC delimiter in incoming message.")
 
-            # Combine the HMAC with the message separated by a delimiter
-            msg_with_hmac = msg.encode() + b'||HMAC||' + hmac_digest 
+                message_part, received_hmac = plaintext.rsplit(b'||HMAC||', 1)
+                # Recompute HMAC to verify
+                expected_hmac = hmac.new(self.hmac_key, message_part, hashlib.sha256).digest()
+                if not hmac.compare_digest(received_hmac, expected_hmac):
+                    raise ValueError("HMAC verification failed for incoming message.")
 
-            # Generate a random 12 byte nonce for encryption
+                # Everything checks out
+                self.append_chat(message_part.decode(errors='replace'))
+
+        except Exception as e:
+            self.append_chat(f"[Error receiving]: {str(e)}")
+
+    ###############################################################################
+    # Sending messages
+    ###############################################################################
+    def send_message(self):
+        msg = self.msg_entry.get().strip()
+        if not msg or not self.aesgcm:
+            return
+        self.msg_entry.delete(0, tk.END)
+
+        try:
+            # Combine message + HMAC
+            # 1) Generate HMAC of the plaintext
+            hmac_digest = hmac.new(self.hmac_key, msg.encode(), hashlib.sha256).digest()
+            msg_with_hmac = msg.encode() + b'||HMAC||' + hmac_digest
+
+            # 2) Encrypt using AES-GCM
             nonce = os.urandom(12)
-            
-            # Encrypt the plaintext message and HMAC with the nonce 
-            ciphertext = aesgcm.encrypt(nonce, msg_with_hmac, None)
-            
-            # Build the packet to be sent
+            ciphertext = self.aesgcm.encrypt(nonce, msg_with_hmac, None)
+
+            # 3) Construct packet
             packet = (
                 b"MSG"
                 + len(nonce).to_bytes(2, 'big')
@@ -189,16 +251,19 @@ def main():
                 + ciphertext
             )
 
-            # Send the encrypted packet to the server
-            sock.sendall(packet)
+            # 4) Send
+            self.sock.sendall(packet)
 
-    except KeyboardInterrupt:
-        print("\nExiting...")
-    
-    # Close the socket
-    finally:
-        sock.close()
+            # Echo to local chat
+            self.append_chat(f"[You]: {msg}")
 
-# Start the program
+        except Exception as e:
+            self.append_chat(f"[Send Error]: {str(e)}")
+
+###############################################################################
+# Main: Launch the tkinter-based UI
+###############################################################################
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = SecureChatClient(root)
+    root.mainloop()
