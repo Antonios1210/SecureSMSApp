@@ -17,11 +17,6 @@ SERVER_PORT = 4000
 TENANT_ID = "2940786f-5af0-48fb-adb7-56da78440d61"
 CLIENT_ID = "2cfbeb4e-3216-485c-bbc3-8f408b55a969"
 
-# Previously hardcoded keys are now replaced with derived keys.
-# The following static definitions have been removed:
-# SHARED_KEY = b'ThisIsASecretKeyForAES256Encrypt'
-# HMAC_KEY = b"ThisIsASecretKeyForHMAC256"
-
 # Store connected clients as a tuple consisting of their associated socket, nickname, AESGCM instance, and HMAC key
 clients = []
 
@@ -112,12 +107,26 @@ def derive_keys(user_id: str, time_slice: str) -> (bytes, bytes):
 
 # Function to encrypt and send the message to all other connected clients
 def broadcast_message(sender_socket, nickname, plaintext):
+    # 1) Build the broadcast text (including nickname)
     full_text = f"[{nickname}] {plaintext.decode(errors='replace')}"
-    # For each client, re-encrypt the broadcast message using that client's derived AES key
+
+    # For each client, re-encrypt the broadcast message using that client's derived AES and HMAC keys
     for (cli_sock, cli_nick, aesgcm, hmac_key) in clients:
+        # Skip sending back to the message sender, so they only see their local "[You]" echo
+        if cli_sock == sender_socket:
+            continue
+
         try:
+            # 2) Compute an HMAC for the broadcast text, then append it with the delimiter
+            message_bytes = full_text.encode()
+            digest = hmac.new(hmac_key, message_bytes, hashlib.sha256).digest()
+            broadcast_plain = message_bytes + b'||HMAC||' + digest
+
+            # 3) Encrypt using AES-GCM
             nonce = os.urandom(12)
-            ciphertext = aesgcm.encrypt(nonce, full_text.encode(), None)
+            ciphertext = aesgcm.encrypt(nonce, broadcast_plain, None)
+
+            # 4) Construct the message packet
             packet = (
                 b"MSG"
                 + len(nonce).to_bytes(2, 'big')
@@ -125,7 +134,10 @@ def broadcast_message(sender_socket, nickname, plaintext):
                 + len(ciphertext).to_bytes(4, 'big')
                 + ciphertext
             )
+
+            # 5) Send to each client
             cli_sock.sendall(packet)
+
         except Exception as e:
             print(f"Failed to broadcast to {cli_nick}: {str(e)}")
 
@@ -215,7 +227,6 @@ def handle_client(client_sock):
 
                 # HMAC Verification
                 # Check if the message is missing the delimiter that separates it from the HMAC
-                # If it is missing, raise an exception that it is missing
                 if b'||HMAC||' not in plaintext:
                     raise ValueError("Missing HMAC delimiter")
 
@@ -226,7 +237,6 @@ def handle_client(client_sock):
                 expected_hmac = hmac.new(hmac_key, message_part, hashlib.sha256).digest()
 
                 # Check if the expected HMAC matches the received HMAC to verify integrity
-                # If it does not match, raise an exception that the verification failed
                 if not hmac.compare_digest(received_hmac, expected_hmac):
                     raise ValueError("HMAC verification failed")
 
@@ -235,47 +245,32 @@ def handle_client(client_sock):
                 print(f"{nickname}: {message_part.decode(errors='replace')}")
                 broadcast_message(client_sock, nickname, message_part)
 
-            # If any of the decryption, missing delimiter, or invalid HMAC checks fail,
-            # raise an exception that the message failed to pass the integrity check
             except Exception as e:
                 print(f"[SECURITY] Message from {nickname} failed integrity check: {str(e)}")
 
-    # If any of the checks fail, raise an exception and print there was an error
-    # The message will not be broadcasted to the other connected clients
     except Exception as e:
         print(f"Error in handle_client for {nickname}: {str(e)}")
     
-    # Once a connected client disconnects, remove them from the clients list
     finally:
         print(f"[SERVER] {nickname} disconnected.")
         for i, (s, n, _, _) in enumerate(clients):
             if s == client_sock:
                 clients.pop(i)
                 break
-
-        # Close the socket
         client_sock.close()
 
 # Main function to set up the server and accept incoming client connections and create threads
 def main():
-    # Set up the server, bind it, and wait for an incoming client connection
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((SERVER_HOST, SERVER_PORT))
     server.listen(5)
     
-    # Print to the server terminal that the server is running
     print(f"Server running on {SERVER_HOST}:{SERVER_PORT}")
     
     while True:
-        # Accept an incoming client connection
         client, addr = server.accept()
-        
-        # Print to the server terminal that the client is connected
         print(f"New connection from {addr}")
-
-        # Create a thread for the client
         threading.Thread(target=handle_client, args=(client,), daemon=True).start()
         
-# Start the program
 if __name__ == "__main__":
     main()
